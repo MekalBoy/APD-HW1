@@ -16,7 +16,24 @@ public class TaskExecutor {
 
     public List<EntryResult> ExecuteWork(int numberOfThreads, List<StorageTask> tasks, LockType lockType) {
         /* IMPLEMENT HERE THE THREAD POOL, ASSIGN THE TASKS AND RETURN THE RESULTS */
-        return new ArrayList<>();
+        List<EntryResult> results = new ArrayList<>();
+
+        switch (lockType) {
+	        case ReaderPreferred -> {
+	        }
+	        case WriterPreferred1 -> {
+	        }
+	        case WriterPreferred2 -> {
+	        }
+            default -> {
+                System.err.println("Invalid LockType!");
+            }
+        }
+//        for (StorageTask task : tasks) {
+            results = ExecuteWorkSerial(tasks);
+//        }
+
+        return results;
     }
 
     public List<EntryResult> ExecuteWorkSerial(List<StorageTask> tasks) {
