@@ -1,9 +1,10 @@
+#include <ctype.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_BUFFER 64 // How big can a line be anyway?
+#define MAX_BUFFER 512 // How big can a line be anyway?
 
 struct args {
     int thread_id;
@@ -20,6 +21,19 @@ struct fileinfo {
     FILE* file;
 };
 
+struct wordList {
+    pthread_mutex_t listMutex;
+    int totalWords; // how many words are in the list
+    int capacity; // how many words can there be in the list
+    struct wordInfo** list;
+};
+
+struct wordInfo {
+    char word[MAX_BUFFER];
+    int timesFound; // in how many files is the word
+    int filesFound[MAX_BUFFER];
+};
+
 void printArgs(struct args myargs) {
     printf("thread_id %d; nr_files %d\n", myargs.thread_id, myargs.nr_files);
     if (myargs.nr_files > 0) {
@@ -29,7 +43,7 @@ void printArgs(struct args myargs) {
     }
 }
 
-unsigned long fsize(char* file)
+unsigned long fsize(char *file)
 {
     FILE *f = fopen(file, "r");
     fseek(f, 0, SEEK_END);
@@ -39,35 +53,119 @@ unsigned long fsize(char* file)
     return len;
 }
 
+void processString(char *input, char *output) {
+    int c = 0;
+    for (int i = 0; input[i] != '\0'; i++) {
+        if (input[i] == '.' || input[i] == ',' || input[i] == '?' || input[i] == '!') {
+            // Skip dots and commas
+            continue;
+        }
+
+        if (isalpha(input[i])) {
+            output[c++] = tolower(input[i]);
+        } else {
+            output[c++] = input[i];
+        }
+    }
+
+    output[c] = '\0';
+}
+
+struct wordInfo* findWord(struct wordList *list, char *word) {
+    for (int i = 0; i < list->totalWords; i++) {
+        if (strcmp(word, list->list[i]->word) == 0) {
+            // printf("FOund %s before!\n", word);
+            return list->list[i];
+        }
+    }
+
+    return NULL;
+}
+
 void *mapper(void *arg) {
     struct args myargs = *(struct args *)arg;
 
     printf("Mapper %d started.\n", myargs.thread_id);
 
     printf("Mapper %d has %d files.\n", myargs.thread_id, myargs.nr_files);
-    printArgs(myargs);
+    // printArgs(myargs);
+    struct wordList localList;
+    localList.capacity = MAX_BUFFER;
+    localList.totalWords = 0;
+    localList.list = malloc(localList.capacity * sizeof(struct wordInfo));
 
     char wordBuffer[MAX_BUFFER];
+    char goodBuffer[MAX_BUFFER];
     if (myargs.nr_files > 0) { 
         for (int i = 0; i < myargs.nr_files; i++) {
             myargs.files[i].file = fopen(myargs.files[i].fileName, "r");
 
-            char *hehe = malloc(sizeof(char) * MAX_BUFFER * 10);
-            hehe[0] = '\0';
-            sprintf(hehe, "%d - ", myargs.thread_id);
+            // It's not going to read more than the usual size probably
+            // char *hehe = malloc(myargs.files[i].size + MAX_BUFFER);
+            // hehe[0] = '\0';
+            // sprintf(hehe, "%d - ", myargs.thread_id);
 
             while (fscanf(myargs.files[i].file, "%s\n", wordBuffer) == 1) {
-                strcat(hehe, wordBuffer);
-                strcat(hehe, " ");
-                // printf("%s ", wordBuffer);
-            }
-            printf("%s\n", hehe);
+                processString(wordBuffer, goodBuffer);
 
-            free(hehe);
+                struct wordInfo *wordInList = findWord(&localList, goodBuffer);
+
+                // If we haven't found the word before, we add it to the list
+                if (wordInList == NULL) {
+                    struct wordInfo newWord;
+                    wordInList = &newWord;
+
+                    strcpy(wordInList->word, goodBuffer);
+                    wordInList->timesFound = 0;
+
+                    if (localList.capacity == localList.totalWords - 2) {
+                        localList.list = realloc(localList.list, localList.capacity * 2 * sizeof(struct wordInfo));
+                        localList.capacity *= 2;
+                    }
+
+                    localList.list[localList.totalWords] = wordInList;
+                    localList.totalWords++;
+                }
+
+                // Check to see if we found it before IN THIS FILE
+                int foundInFile = 0;
+                for (int j = 0; j < wordInList->timesFound && (!foundInFile); j++) {
+                    if (wordInList->filesFound[j] == myargs.files[i].id) {
+                        foundInFile = 1;
+                    }
+                }
+
+                if (!foundInFile) {
+                    // if (myargs.thread_id == 0)
+                    //     printf("Found new word! %s in %d\n", goodBuffer, myargs.files[i].id);
+                    wordInList->filesFound[wordInList->timesFound] = myargs.files[i].id;
+                    wordInList->timesFound++;
+                }
+            }
+            // printf("%s\n", hehe);
+
+            // free(hehe);
 
             fclose(myargs.files[i].file);
         }
     }
+
+    // Process everything locally, then write them into the masterList
+
+    // take mutex
+    // write to masterList
+    // release mutex
+    // if (myargs.thread_id == 0) {
+    //     for (int i = 0; i < localList.totalWords; i++) {
+    //         printf("[%s] in ", localList.list[i].word);
+    //         for (int j = 0; j < localList.list[i]->timesFound; j++) {
+    //             printf("%d ", localList.list[i].filesFound[j]);
+    //         }
+    //         printf("\n");
+    //     }
+    // }
+
+    free(localList.list);
 
     pthread_barrier_wait(myargs.mapstop);
     return 0;
@@ -80,6 +178,13 @@ void *reducer(void *arg) {
     pthread_barrier_wait(myargs.mapstop);
 
     printf("Reducer %d started.\n", myargs.thread_id);
+
+    // Check vector of 26 mutexes+isTaken
+    // take mutex
+    // if isTaken == 0, isTaken = 1 and release mutex and start writing into the a,b,c etc files
+    // - take file_mutex, write into file, release file_mutex
+    // if isTaken == 1, release mutex
+    // if past z, finish
     return 0;
 }
 
@@ -115,7 +220,7 @@ void greedyPartition(struct fileinfo *files, int fileCount, int N, struct filein
 int main(int argc, char **argv)
 {
     // Debug variable - mostly enables a lot of printfs
-    int debug = 1;
+    int debug = 0;
 
     // Validate arguments
 
@@ -183,9 +288,9 @@ int main(int argc, char **argv)
         }
 
         totalBytes += fsize(lineBuffer);
-        if (debug) {
-            printf("File %s has size %lu.\n", lineBuffer, fsize(lineBuffer));
-        }
+        // if (debug) {
+        //     printf("File %s has size %lu.\n", lineBuffer, fsize(lineBuffer));
+        // }
 
         struct fileinfo newFile;
         strcpy(newFile.fileName, lineBuffer);
@@ -219,15 +324,15 @@ int main(int argc, char **argv)
         arguments[i].files = realloc(arguments[i].files, arguments[i].nr_files * sizeof(struct fileinfo));
     }
 
-    if (debug) {
-        for (int i = 0; i < nr_mappers; i++) {
-            printf("Subset %d (Total %d):\n", i + 1, subsetSums[i]);
-            for (int j = 0; j < subsetCounts[i]; j++) {
-                printf("- File: %s, id: %d, size: %d\n", subsets[i][j].fileName, subsets[i][j].id, subsets[i][j].size);
-            }
-            printf("\n");
-        }
-    }
+    // if (debug) {
+    //     for (int i = 0; i < nr_mappers; i++) {
+    //         printf("Subset %d (Total %d):\n", i + 1, subsetSums[i]);
+    //         for (int j = 0; j < subsetCounts[i]; j++) {
+    //             printf("- File: %s, id: %d, size: %d\n", subsets[i][j].fileName, subsets[i][j].id, subsets[i][j].size);
+    //         }
+    //         printf("\n");
+    //     }
+    // }
 
     // Initialize threads
 
