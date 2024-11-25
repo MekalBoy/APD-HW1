@@ -1,6 +1,7 @@
 #include <ctype.h>
 #include <fstream>
 #include <pthread.h>
+#include <queue>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,23 +20,29 @@ struct fileinfo {
     char fileName[MAX_BUFFER];
     int id;
     int size;
-    FILE* file;
 };
 
 struct wordList {
-    pthread_mutex_t listMutex;
+    pthread_mutex_t listMutex; // not used locally - only on masterList
     std::unordered_map<std::string, std::vector<int>> list;
+};
+
+struct writingQueue {
+    pthread_mutex_t queueMutex;
+    std::queue<char> queue;
 };
 
 struct args {
     int thread_id;
     pthread_barrier_t* mapstop; // Barrier that everyone syncs to
     int nr_files; // Number of files a mapper will handle
-    int nr_bytes; // Total size of the files the mapper has
+    int nr_bytes; // Total size of the files the mapper has (used for debugging)
     struct fileinfo* files; // The files a mapper will process
     struct wordList* masterList; // The list every mapper will write to and reducers will read from
+    struct writingQueue* writeQueue; // The list from where reducers get their writing assignments
 };
 
+// Debug function
 void printArgs(struct args myargs) {
     printf("thread_id %d; nr_files %d\n", myargs.thread_id, myargs.nr_files);
     if (myargs.nr_files > 0) {
@@ -45,6 +52,7 @@ void printArgs(struct args myargs) {
     }
 }
 
+// Returns the size of a file
 unsigned long fsize(char *file)
 {
     FILE *f = fopen(file, "r");
@@ -55,15 +63,24 @@ unsigned long fsize(char *file)
     return len;
 }
 
-void processString(const string& input, string& output) {
-    output.clear(); // Clear any existing content in output
-    for (char ch : input) {
-        if (isalpha(ch)) {
-            output += tolower(ch);
+// Sanitize input and write into output
+void processString(string& input, string& output) {
+    output.clear(); // Clear output first
+    for (char c : input) {
+        if (isalpha(c)) {
+            output += tolower(c);
         }
     }
 }
 
+bool compareWordlists(const std::pair<string, vector<int>>& a, const std::pair<string, vector<int>>& b) {
+    if (a.second.size() != b.second.size()) {
+        return a.second.size() > b.second.size();
+    }
+
+    // If sizes are equal, compare by word
+    return a.first < b.first;
+}
 
 void *mapper(void *arg) {
     struct args myargs = *(struct args *)arg;
@@ -71,7 +88,8 @@ void *mapper(void *arg) {
     printf("Mapper %d started.\n", myargs.thread_id);
 
     printf("Mapper %d has %d files.\n", myargs.thread_id, myargs.nr_files);
-    // printArgs(myargs);
+
+    // Partial list that's written at the end, when it's filled out
     struct wordList localList;
 
     if (myargs.nr_files > 0) { 
@@ -85,34 +103,21 @@ void *mapper(void *arg) {
                 processString(word, goodWord);
                 
                 vector<int> &wordInfo = localList.list[goodWord];
+
+                // If it doesn't exist or it exists but without the current file id
                 if (wordInfo.empty() || std::find(wordInfo.begin(), wordInfo.end(), myargs.files[i].id) == wordInfo.end()) {
                     wordInfo.push_back(myargs.files[i].id);
                 }
             }
-            // printf("%s\n", hehe);
-
-            // free(hehe);
 
             file.close();
         }
     }
 
-    // Process everything locally, then write them into the masterList
+    // Processed everything locally, now to write them into the masterList
 
-    // if (myargs.thread_id == 0) {
-    //     for (auto& [word, files] : localList.list) {
-    //         std::cout << "Word: " << word << "; Files: ";
-    //         for (int fileId : files) {
-    //             std::cout << fileId << " ";
-    //         }
-    //         std::cout << "\n";
-    //     }
-    // }
-
-    // take mutex
     pthread_mutex_lock(&myargs.masterList->listMutex);
 
-    // write to masterList
     for (auto& wordInfo : localList.list) {
         const std::string& word = wordInfo.first;
         std::vector<int>& localFileIds = wordInfo.second;
@@ -120,7 +125,7 @@ void *mapper(void *arg) {
         // Check if the word already exists in the master list
         auto it = myargs.masterList->list.find(word);
         if (it == myargs.masterList->list.end()) {
-            // Word does not exist, add it with the local file IDs
+            // Word does not exist, add it with file id
             myargs.masterList->list[word] = localFileIds;
         } else {
             // Word exists, update its vector of file IDs
@@ -129,17 +134,17 @@ void *mapper(void *arg) {
             // Iterate through the local file IDs and add any that are missing
             for (int localFileId : localFileIds) {
                 if (std::find(masterFileIds.begin(), masterFileIds.end(), localFileId) == masterFileIds.end()) {
-                    // File ID not found, so insert it
+                    // Not found in this file before, insert it
                     masterFileIds.push_back(localFileId);
                 }
             }
         }
     }
 
-    // release mutex
     pthread_mutex_unlock(&myargs.masterList->listMutex);
 
     pthread_barrier_wait(myargs.mapstop);
+
     return 0;
 }
 
@@ -151,22 +156,59 @@ void *reducer(void *arg) {
 
     printf("Reducer %d started.\n", myargs.thread_id);
 
-    // if (myargs.thread_id == 1) {
-    //     for (auto& [word, files] : myargs.masterList->list) {
-    //         std::cout << "Word: " << word << "; Files: ";
-    //         for (int fileId : files) {
-    //             std::cout << fileId << " ";
-    //         }
-    //         std::cout << "\n";
-    //     }
-    // }
+    while (1) {
+        // Take from the queue
 
-    // Check vector of 26 mutexes+isTaken
-    // take mutex
-    // if isTaken == 0, isTaken = 1 and release mutex and start writing into the a,b,c etc files
-    // - take file_mutex, write into file, release file_mutex
-    // if isTaken == 1, release mutex
-    // if past z, finish
+        pthread_mutex_lock(&myargs.writeQueue->queueMutex);
+
+        if (myargs.writeQueue->queue.empty()) {
+            pthread_mutex_unlock(&myargs.writeQueue->queueMutex);
+            break;
+        }
+
+        char currentChar = myargs.writeQueue->queue.front();
+        myargs.writeQueue->queue.pop();
+
+        pthread_mutex_unlock(&myargs.writeQueue->queueMutex);
+
+        // Make due with current character
+
+        ofstream file;
+        
+        char fileName[10];
+        sprintf(fileName, "%c.txt", currentChar);
+        file.open(fileName);
+
+        // Storing to sort as I wish
+        std::vector<std::pair<std::string, std::vector<int>>> sortedWords;
+
+        for (auto& [word, files] : myargs.masterList->list) {
+            sortedWords.push_back({word, files});
+        }
+
+        std::sort(sortedWords.begin(), sortedWords.end(), &compareWordlists);
+
+        for (auto& [word, files] : sortedWords) {
+            if (word[0] == currentChar) {
+                file << word << ":[";
+                
+                std::sort(files.begin(), files.end());
+
+                // g++ screams at me if I don't use size_t
+                for (size_t i = 0; i < files.size(); i++) {
+                    file << files[i];
+                    if (i < files.size() - 1) { // if not last element
+                        file << " ";
+                    }
+                }
+
+                file << "]\n";
+            }
+        }
+
+        file.close();
+    }
+
     return 0;
 }
 
@@ -176,6 +218,7 @@ int compareSizeDesc(const void *a, const void *b) {
     return (B.size - A.size);
 }
 
+// https://en.wikipedia.org/wiki/Greedy_number_partitioning -> https://en.wikipedia.org/wiki/Longest-processing-time-first_scheduling
 void greedyPartition(struct fileinfo *files, int fileCount, int N, struct fileinfo **subsets, int *subsetSums, int *subsetCounts) {
     for (int i = 0; i < N; i++) {
         subsetSums[i] = 0;
@@ -253,11 +296,18 @@ int main(int argc, char **argv)
     struct wordList masterList;
     pthread_mutex_init(&masterList.listMutex, NULL);
 
+    struct writingQueue masterQueue;
+    pthread_mutex_init(&masterQueue.queueMutex, NULL);
+    for (char c = 'a'; c <= 'z'; c++) {
+        masterQueue.queue.push(c);
+    }
+
     for (int i = 0; i < NUM_THREADS; i++) {
         arguments[i].nr_files = 0;
         arguments[i].nr_bytes = 0;
         arguments[i].files = NULL;
         arguments[i].masterList = &masterList;
+        arguments[i].writeQueue = &masterQueue;
     }
 
     struct fileinfo files[nr_files];
@@ -274,13 +324,10 @@ int main(int argc, char **argv)
         }
 
         totalBytes += fsize(lineBuffer);
-        // if (debug) {
-        //     printf("File %s has size %lu.\n", lineBuffer, fsize(lineBuffer));
-        // }
 
         struct fileinfo newFile;
         strcpy(newFile.fileName, lineBuffer);
-        newFile.id = i;
+        newFile.id = i + 1;
         newFile.size = fsize(newFile.fileName);
 
         files[i] = newFile;
@@ -360,6 +407,9 @@ int main(int argc, char **argv)
 
     // Wrap-up (free & close)
 
+    // Initial pointer not needed anymore
+    free(subsets);
+
     for (int i = 0; i < NUM_THREADS; i++) {
         if (i < nr_mappers) {
             // Mappper arg freeing
@@ -369,11 +419,9 @@ int main(int argc, char **argv)
         }
     }
 
-    pthread_mutex_destroy(&masterList.listMutex);
     pthread_barrier_destroy(&mapstop);
-
-    // Initial pointer not needed anymore
-    free(subsets);
+    pthread_mutex_destroy(&masterList.listMutex);
+    pthread_mutex_destroy(&masterQueue.queueMutex);
 
     return 0;
 }
