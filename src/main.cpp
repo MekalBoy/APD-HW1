@@ -8,9 +8,7 @@
 
 #include <algorithm>
 #include <iostream>
-#include <string>
 #include <unordered_map>
-#include <vector>
 
 using namespace std;
 
@@ -24,7 +22,7 @@ struct fileinfo {
 
 struct wordList {
     pthread_mutex_t listMutex; // not used locally - only on masterList
-    std::unordered_map<std::string, std::vector<int>> list;
+    std::unordered_map<string, vector<int>> list;
 };
 
 struct writingQueue {
@@ -156,6 +154,15 @@ void *reducer(void *arg) {
 
     printf("Reducer %d started.\n", myargs.thread_id);
 
+    // Storing to sort as I wish
+    vector<std::pair<string, vector<int>>> sortedWords;
+
+    for (auto& [word, files] : myargs.masterList->list) {
+        sortedWords.push_back({word, files});
+    }
+
+    std::sort(sortedWords.begin(), sortedWords.end(), &compareWordlists);
+
     while (1) {
         // Take from the queue
 
@@ -178,15 +185,6 @@ void *reducer(void *arg) {
         char fileName[10];
         sprintf(fileName, "%c.txt", currentChar);
         file.open(fileName);
-
-        // Storing to sort as I wish
-        std::vector<std::pair<std::string, std::vector<int>>> sortedWords;
-
-        for (auto& [word, files] : myargs.masterList->list) {
-            sortedWords.push_back({word, files});
-        }
-
-        std::sort(sortedWords.begin(), sortedWords.end(), &compareWordlists);
 
         for (auto& [word, files] : sortedWords) {
             if (word[0] == currentChar) {
